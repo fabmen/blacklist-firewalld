@@ -141,9 +141,9 @@ process_ips() {
 ensure_ipset_exists() {
     local ipset_name="$1" family="$2"
     
-    if firewall-cmd -q --zone="${FIREWALLD_ZONE}" --query-source=ipset:"${ipset_name}"; then
+    #if firewall-cmd -q --zone="${FIREWALLD_ZONE}" --query-source=ipset:"${ipset_name}"; then
         firewall-cmd -q --permanent --delete-ipset="${ipset_name}"
-    fi
+    #fi
     firewall-cmd --permanent --new-ipset="${ipset_name}" --type=hash:net --option=family="${family}" --option=hashsize=1048576 --option=maxelem="${MAXELEM}" 
 
     if ! firewall-cmd --zone="${FIREWALLD_ZONE}" --query-rich-rule="rule source ipset=${ipset_name} drop" 2>/dev/null; then
@@ -165,8 +165,7 @@ update_blacklist() {
 
     # Add the address ranges by country per ipdeny.com to the blacklist
     for country in $COUNTRIES; do
-        firewall-cmd -q --permanent --ipset=blacklist \
-            --add-entries-from-file=./$country.zone && \
+        cat ./$country.zone >> "$tmp_file" && \
             echo "Added $country to blacklist ipset."
     done
 
