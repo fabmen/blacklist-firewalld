@@ -189,6 +189,8 @@ update_blacklist() {
     process_ips "$tmp_file" "$tmp_file" "$ip_version"
     firewall-cmd --permanent --ipset=${ipset_name} --add-entries-from-file="$tmp_file"
     rm -f "$tmp_file"
+    popd
+    rm -rf $ipdeny_tmp_dir
 }
 
 usage() {
@@ -220,8 +222,7 @@ main() {
 
     firewall-cmd -q --reload
 
-    popd
-    rm -rf $ipdeny_tmp_dir
+    
 }
 
 main "$@"
