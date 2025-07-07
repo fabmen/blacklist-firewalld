@@ -4,4 +4,4 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/firewalld-blacklist
+ExecStart=/usr/local/sbin/firewalld-blacklist -c /etc/firewalld/firewalld-blacklist.conf
