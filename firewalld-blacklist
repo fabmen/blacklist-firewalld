@@ -1,0 +1,229 @@
+#!/bin/bash
+# Based on the below article
+# https://www.linode.com/community/questions/11143/top-tip-firewalld-and-ipset-country-blacklist
+
+set -euo pipefail
+#set -x
+
+CONFIG_FILE="/etc/blacklist-firewalld.conf"
+LOG_FILE="/var/log/blacklist.log"
+DRY_RUN=false
+USE_IPRANGE=false
+
+IPSET_NAME="blacklist"
+IPSET_V6_NAME="blacklist-v6"
+IPSET_TIMEOUT="86400"
+MAXELEM="65536"
+FIREWALLD_ZONE="public"
+BLACKLIST_URLS=(
+    "https://lists.blocklist.de/lists/all.txt"
+)
+BLACKLIST_V6_URLS=()
+WHITELIST=()
+WHITELIST_V6=()
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+load_config() {
+    local config_file="$1"
+    if [[ -f "$config_file" ]]; then
+        source "$config_file"
+        log "Loaded config from $config_file"
+    else
+        log "Using default configuration"
+    fi
+}
+
+parse_arguments() {
+    while (( $# )); do
+        case "$1" in
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+check_dependencies() {
+    local missing=()
+    
+    for cmd in curl ipset firewall-cmd; do
+        command_exists "$cmd" || missing+=("$cmd")
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        die "Missing required commands: ${missing[*]}"
+    fi
+
+    if command_exists iprange; then
+        USE_IPRANGE=true
+    fi
+}
+
+download_blacklist() {
+    local url="$1" output_file="$2"
+    local max_retries=3 retry_delay=5
+
+    echo $url
+    for ((i=1; i<=max_retries; i++)); do
+        if curl -L  --connect-timeout 20 --max-time 60 -o "$output_file" "$url"; then
+            return 0
+        fi
+        sleep "$retry_delay"
+    done
+    die "Failed to download $url after $max_retries attempts"
+}
+
+process_ips() {
+    local input_file="$1" output_file="$2" version="$3"
+    local pattern
+
+    case "$version" in
+        4) pattern='([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' ;;
+        6) pattern='([a-f0-9:]+:+)+[a-f0-9]+(/\d{1,3})?' ;;
+        *) die "Invalid IP version: $version" ;;
+    esac
+
+    grep -Eo "$pattern" "$input_file" > "$output_file.tmp"
+
+    if [[ "$USE_IPRANGE" == true ]]; then
+        iprange --optimize "$output_file.tmp" > "$output_file.opt"
+        mv "$output_file.opt" "$output_file.tmp"
+    fi
+
+    local whitelist=()
+    if [[ "$version" == 4 ]] && (( ${#WHITELIST[@]} > 0 )); then
+        whitelist=("${WHITELIST[@]}")
+    elif [[ "$version" == 6 ]] && (( ${#WHITELIST_V6[@]} > 0 )); then
+        whitelist=("${WHITELIST_V6[@]}")
+    fi
+
+    if (( ${#whitelist[@]} > 0 )); then
+        if [[ "$USE_IPRANGE" == true ]]; then
+            printf "%s\n" "${whitelist[@]}" > "$output_file.wl"
+            iprange --except "$output_file.wl" "$output_file.tmp" > "$output_file"
+            rm -f "$output_file.wl"
+        else
+            grep -vFf <(printf "%s\n" "${whitelist[@]}") "$output_file.tmp" > "$output_file"
+        fi
+    else
+        mv "$output_file.tmp"  "$output_file"
+
+    fi
+
+    [[ -s "$output_file" ]] || die "No valid IPs remaining after processing"
+}
+
+
+ensure_ipset_exists() {
+    local ipset_name="$1" family="$2"
+    
+    if firewall-cmd -q --zone="${FIREWALLD_ZONE}" --query-source=ipset:"${ipset_name}"; then
+        firewall-cmd -q --permanent --delete-ipset="${ipset_name}"
+    fi
+    firewall-cmd --permanent --new-ipset="${ipset_name}" --type=hash:net --option=family="${family}" --option=hashsize=1048576 --option=maxelem="${MAXELEM}" 
+
+    if ! firewall-cmd --zone="${FIREWALLD_ZONE}" --query-rich-rule="rule source ipset=${ipset_name} drop" 2>/dev/null; then
+        firewall-cmd --permanent --zone="${FIREWALLD_ZONE}" \
+            --add-rich-rule="rule source ipset=${ipset_name} drop" >/dev/null
+    fi
+}
+
+update_blacklist() {
+    local ipset_name="$1" ip_version="$2"
+    local tmp_file=$(mktemp)
+    
+    local ipdeny_tmp_dir=$(mktemp -d -t blacklist-XXXXXXXXXX)
+    pushd $ipdeny_tmp_dir
+
+    # Download the latest network adresses by country file
+    curl -LO http://www.ipdeny.com/ipblocks/data/countries/all-zones.tar.gz
+    tar xf all-zones.tar.gz
+
+    # Add the address ranges by country per ipdeny.com to the blacklist
+    for country in $COUNTRIES; do
+        firewall-cmd -q --permanent --ipset=blacklist \
+            --add-entries-from-file=./$country.zone && \
+            echo "Added $country to blacklist ipset."
+    done
+
+    local url_array="BLACKLIST_URLS"
+    [[ "$ip_version" == 6 ]] && url_array="BLACKLIST_V6_URLS"
+    
+    eval "local urls=(\"\${${url_array}[@]}\")"
+    (( ${#urls[@]} == 0 )) && return 0
+
+    for url in "${urls[@]}"; do
+        local dl_file=$(mktemp)
+        download_blacklist "$url" "$dl_file"
+        cat "$dl_file" >> "$tmp_file"
+        rm -f "$dl_file"
+    done
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "Dry-run: Would update ${ipset_name} with $(wc -l < "$tmp_file") IPv${ip_version} ranges (maxelem=${MAXELEM})"
+        return 0
+    fi
+    process_ips "$tmp_file" "$tmp_file" "$ip_version"
+    firewall-cmd --permanent --ipset=${ipset_name} --add-entries-from-file="$tmp_file"
+    rm -f "$tmp_file"
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 [--dry-run] [--help]
+
+Options:
+  -c, --config FILE   Specify config file (default: /etc/ipset-blacklist-firewalld.conf)
+  --dry-run    Validate config without applying changes
+  --help       Show this help message
+EOF
+    exit 0
+}
+
+main() {
+    parse_arguments "$@"
+    load_config "$CONFIG_FILE"
+    check_dependencies
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+
+    ensure_ipset_exists "$IPSET_NAME" "inet"
+    (( ${#BLACKLIST_V6_URLS[@]} > 0 )) && ensure_ipset_exists "$IPSET_V6_NAME" "inet6"
+
+    update_blacklist "$IPSET_NAME" 4
+    (( ${#BLACKLIST_V6_URLS[@]} > 0 )) && update_blacklist "$IPSET_V6_NAME" 6
+
+    firewall-cmd -q --reload
+
+    popd
+    rm -rf $ipdeny_tmp_dir
+}
+
+main "$@"
+

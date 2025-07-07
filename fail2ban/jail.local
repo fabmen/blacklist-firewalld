@@ -1,0 +1,33 @@
+[nginx-404]
+enabled  = true
+port     = http,https
+filter   = nginx-404
+logpath  = /var/log/nginx/access.log
+maxretry = 5
+findtime = 60m
+bantime  = 24h
+
+[nginx-444]
+enabled  = true
+port     = http,https
+filter   = nginx-444
+logpath  = /var/log/nginx/access.log
+maxretry = 1
+bantime  = 48h
+
+[nginx-badbots]
+enabled  = true
+port     = http,https
+filter   = nginx-badbots
+logpath  = /var/log/nginx/access.log
+bantime  = 48h
+maxretry = 1
+
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+filter   = nginx-limit-req
+logpath  = /var/log/nginx/access.log
+maxretry = 10
+findtime = 60m
+bantime  = 24h
